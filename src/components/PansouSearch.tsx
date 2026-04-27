@@ -49,6 +49,73 @@ const CLOUD_TYPE_COLORS: Record<string, string> = {
   others: 'bg-gray-100 text-gray-800 dark:bg-gray-700/40 dark:text-gray-200',
 };
 
+const CHECKABLE_CLOUD_TYPES = new Set([
+  '115',
+  'aliyun',
+  'baidu',
+  'mobile',
+  'quark',
+  'tianyi',
+  'uc',
+  'xunlei',
+  '123',
+]);
+
+const CLOUD_TYPE_TO_CHECK_PLATFORM: Record<string, string> = {
+  '115': '115',
+  aliyun: 'aliyun',
+  baidu: 'baidu',
+  mobile: 'cmcc',
+  quark: 'quark',
+  tianyi: 'tianyi',
+  uc: 'uc',
+  xunlei: 'xunlei',
+  '123': 'pan123',
+};
+
+type CheckItemStatus = 'pending' | 'checking' | 'valid' | 'invalid' | 'unknown' | 'rate_limited';
+
+interface NetdiskCheckTaskPayload {
+  id: string;
+  platform: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  progress: {
+    total: number;
+    done: number;
+    valid: number;
+    invalid: number;
+    unknown: number;
+    rateLimited: number;
+    currentBatch: number;
+    totalBatches: number;
+  };
+  results: Record<string, { status: CheckItemStatus; reason?: string; fromCache?: boolean }>;
+  error?: string;
+}
+
+interface StoredCloudCheckState {
+  taskId: string;
+  task: NetdiskCheckTaskPayload;
+}
+
+const CHECK_STATUS_STYLE: Record<CheckItemStatus, string> = {
+  pending: 'bg-gray-100 text-gray-700 dark:bg-gray-700/50 dark:text-gray-200',
+  checking: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-200',
+  valid: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-200',
+  invalid: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200',
+  unknown: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-200',
+  rate_limited: 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-200',
+};
+
+const CHECK_STATUS_TEXT: Record<CheckItemStatus, string> = {
+  pending: '未检测',
+  checking: '检测中',
+  valid: '有效',
+  invalid: '失效',
+  unknown: '未知',
+  rate_limited: '受限',
+};
+
 export default function PansouSearch({
   keyword,
   triggerSearch,
@@ -63,6 +130,80 @@ export default function PansouSearch({
   const [transferingUrl, setTransferingUrl] = useState<string | null>(null);
   const [playingUrl, setPlayingUrl] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastProps | null>(null);
+  const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
+  const [checkStatesByType, setCheckStatesByType] = useState<Record<string, StoredCloudCheckState>>({});
+
+  useEffect(() => {
+    setCooldownRemainingMs(0);
+    setCheckStatesByType({});
+  }, [keyword, triggerSearch]);
+
+  useEffect(() => {
+    const runningEntries = Object.entries(checkStatesByType).filter(
+      ([, state]) => state.task.status === 'running'
+    );
+    if (runningEntries.length === 0) return;
+
+    let cancelled = false;
+    const timer = setInterval(async () => {
+      const updates = await Promise.all(
+        runningEntries.map(async ([cloudType, state]) => {
+          try {
+            const response = await fetch(`/api/netdisk/check/task?id=${encodeURIComponent(state.taskId)}`);
+            const data = await response.json();
+            if (!response.ok) {
+              throw new Error(data.error || '获取检测进度失败');
+            }
+            return {
+              cloudType,
+              taskId: state.taskId,
+              task: data.task as NetdiskCheckTaskPayload,
+              cooldownRemainingMs: Number(data.cooldownRemainingMs || 0),
+            };
+          } catch (error) {
+            return {
+              cloudType,
+              taskId: state.taskId,
+              task: {
+                ...state.task,
+                status: 'failed',
+                error: error instanceof Error ? error.message : '获取检测进度失败',
+              } as NetdiskCheckTaskPayload,
+              cooldownRemainingMs: 0,
+            };
+          }
+        })
+      );
+
+      if (cancelled) return;
+
+      setCheckStatesByType((prev) => {
+        const next = { ...prev };
+        updates.forEach((update) => {
+          next[update.cloudType] = {
+            taskId: update.taskId,
+            task: update.task,
+          };
+        });
+        return next;
+      });
+      setCooldownRemainingMs(Math.max(0, ...updates.map((item) => item.cooldownRemainingMs)));
+      updates.forEach((update) => {
+        if (update.task.status === 'failed' && update.task.error) {
+          setToast({
+            message: `${CLOUD_TYPE_NAMES[update.cloudType] || update.cloudType}: ${update.task.error}`,
+            type: 'error',
+            onClose: () => setToast(null),
+          });
+        }
+      });
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [checkStatesByType]);
 
   // 提取搜索函数，以便在重试时调用
   const searchPansou = useCallback(async () => {
@@ -206,6 +347,83 @@ export default function PansouSearch({
     }
   };
 
+  const handleStartCheck = async (cloudType: string, links: PansouLink[]) => {
+    try {
+      const platform = CLOUD_TYPE_TO_CHECK_PLATFORM[cloudType];
+      if (!platform) {
+        throw new Error('当前网盘类型暂不支持有效性检测');
+      }
+      const response = await fetch('/api/netdisk/check/start', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          platform,
+          links: links.map((item) => item.url),
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || '启动检测失败');
+      }
+      setCheckStatesByType((prev) => ({
+        ...prev,
+        [cloudType]: {
+          taskId: data.taskId,
+          task: data.task,
+        },
+      }));
+      setCooldownRemainingMs(Number(data.cooldownRemainingMs || 0));
+    } catch (err: any) {
+      setToast({
+        message: err?.message || '启动检测失败',
+        type: 'error',
+        onClose: () => setToast(null),
+      });
+    }
+  };
+
+  const handleCancelCheck = async (cloudType: string) => {
+    const state = checkStatesByType[cloudType];
+    if (!state?.taskId) return;
+    try {
+      const response = await fetch('/api/netdisk/check/cancel', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ taskId: state.taskId }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || '停止检测失败');
+      }
+      setCheckStatesByType((prev) => ({
+        ...prev,
+        [cloudType]: {
+          taskId: state.taskId,
+          task: data.task,
+        },
+      }));
+    } catch (err: any) {
+      setToast({
+        message: err?.message || '停止检测失败',
+        type: 'error',
+        onClose: () => setToast(null),
+      });
+    }
+  };
+
+  const getCloudCheckState = (cloudType: string) => {
+    return checkStatesByType[cloudType]?.task || null;
+  };
+
+  const getCheckResultForUrl = (cloudType: string, url: string) => {
+    const task = getCloudCheckState(cloudType);
+    return task?.results?.[url] || null;
+  };
+
   const renderBody = () => {
     if (loading) {
       return (
@@ -309,17 +527,54 @@ export default function PansouSearch({
 
           const typeName = CLOUD_TYPE_NAMES[cloudType] || cloudType;
           const typeColor = CLOUD_TYPE_COLORS[cloudType] || CLOUD_TYPE_COLORS.others;
+          const checkable = CHECKABLE_CLOUD_TYPES.has(cloudType);
+          const cloudCheckTask = getCloudCheckState(cloudType);
+          const isCheckingThisType = cloudCheckTask?.status === 'running';
+          const groupProgress = cloudCheckTask?.progress || null;
 
           return (
             <div key={cloudType} className='space-y-3'>
               {/* 网盘类型标题 */}
-              <div className='flex items-center gap-2'>
+              <div className='flex flex-wrap items-center gap-2'>
                 <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium ${typeColor}`}>
                   {typeName}
                 </span>
                 <span className='text-xs text-gray-500 dark:text-gray-400'>
                   {links.length} 个链接
                 </span>
+                {groupProgress && (
+                  <span className='text-xs text-gray-500 dark:text-gray-400'>
+                    进度 {groupProgress.done}/{groupProgress.total} · 有效 {groupProgress.valid} · 失效 {groupProgress.invalid} · 未知 {groupProgress.unknown + groupProgress.rateLimited}
+                  </span>
+                )}
+                {checkable && (
+                  <>
+                    <button
+                      onClick={() => handleStartCheck(cloudType, links)}
+                      disabled={isCheckingThisType}
+                      className='px-3 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-xs transition-colors disabled:opacity-60'
+                    >
+                      {cloudCheckTask
+                        ? cloudCheckTask.status === 'running'
+                          ? '检测中...'
+                          : '重新检测'
+                        : '有效性检测'}
+                    </button>
+                    {isCheckingThisType && (
+                      <button
+                        onClick={() => handleCancelCheck(cloudType)}
+                        className='px-3 py-1 rounded-md bg-gray-600 hover:bg-gray-700 text-white text-xs transition-colors'
+                      >
+                        停止检测
+                      </button>
+                    )}
+                  </>
+                )}
+                {cooldownRemainingMs > 0 && (
+                  <span className='text-xs text-orange-600 dark:text-orange-400'>
+                    冷却中 {Math.ceil(cooldownRemainingMs / 1000)}s
+                  </span>
+                )}
               </div>
 
               {/* 链接列表 */}
@@ -351,6 +606,18 @@ export default function PansouSearch({
 
                       {/* 操作按钮 */}
                       <div className='flex items-center gap-1 flex-shrink-0'>
+                        {(() => {
+                          const checkResult = getCheckResultForUrl(cloudType, link.url);
+                          if (!checkResult) return null;
+                          return (
+                            <span
+                              className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${CHECK_STATUS_STYLE[checkResult.status]}`}
+                              title={checkResult.reason || CHECK_STATUS_TEXT[checkResult.status]}
+                            >
+                              {CHECK_STATUS_TEXT[checkResult.status]}
+                            </span>
+                          );
+                        })()}
                         {(cloudType === 'quark' || cloudType === 'mobile' || cloudType === 'baidu' || cloudType === 'tianyi' || cloudType === '123' || cloudType === 'uc') && (
                           <>
                             <button
@@ -405,6 +672,11 @@ export default function PansouSearch({
                       {link.datetime && (
                         <span>{new Date(link.datetime).toLocaleDateString()}</span>
                       )}
+                      {(() => {
+                        const checkResult = getCheckResultForUrl(cloudType, link.url);
+                        if (!checkResult?.reason) return null;
+                        return <span className='truncate'>检测结果: {checkResult.reason}</span>;
+                      })()}
                     </div>
 
                     {/* 图片预览 */}
